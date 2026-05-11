@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import base64
 import logging
-import secrets
-import time
-from http.cookies import SimpleCookie
 from urllib.parse import ParseResult, urlparse
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
-from .auth import ACCEPT, APP_VERSION, USER_AGENT, redact_api_data
+from .auth import ACCEPT, redact_api_data
+from .auth_manager import ProtonAuthManager, ProtonBearerAuthManager, ProtonCookieAuthManager
 from .crypto import compute_key_password, decrypt_pgp_message
 from .message import proton_message_to_rfc822
 from .token import ProtonTokenData, parse_proton_token
@@ -23,7 +21,7 @@ class ProtonMailClient:
         'inbox': '0',
     }
 
-    def __init__(self, email_account: str, token: Union[str, ProtonTokenData], server_uri: Optional[str] = None):
+    def __init__(self, email_account: str, token: Union[str, ProtonTokenData, None] = None, server_uri: Optional[str] = None, auth_manager: Optional[ProtonAuthManager] = None):
         self.email_account = email_account
         self.server_uri: ParseResult = urlparse(server_uri or 'proton://mail.proton.me')
         host = self.server_uri.hostname or 'mail.proton.me'
@@ -36,27 +34,35 @@ class ProtonMailClient:
             'accept': ACCEPT,
             'x-pm-locale': 'zh_CN',
         })
-        self.uid = None
-        self.access_token = None
-        self.refresh_token = None
-        self.login_password = None
         self.key_password = None
-        self.auth_mode = 'unknown'
         self.total_cache: Dict[str, int] = {}
         self.message_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
         self.private_keys = None
+        self.user_key_passwords = {}
+        self.address_key_passwords = {}
 
-        token_data = parse_proton_token(token) if isinstance(token, str) else token
-        self._configure_token_data(token_data)
+        self.auth_manager = auth_manager or self._create_auth_manager(token)
+        self.auth_manager.apply_headers(self.sess)
+        if not self.auth_manager.access_token and self.auth_manager.refresh_token:
+            self.auth_manager.refresh(self.sess, self.api_url)
         self.user = self.get_proton_user()
         self._load_key_password()
 
+    def _create_auth_manager(self, token: Union[str, ProtonTokenData, None]) -> ProtonAuthManager:
+        if token is None:
+            raise ValueError('token or auth_manager is required')
+        token_data = parse_proton_token(token) if isinstance(token, str) else token
+        if token_data.cookie:
+            return ProtonCookieAuthManager(token_data)
+        return ProtonBearerAuthManager(token_data)
+
     @classmethod
-    def from_access_token(cls, email_account: str, uid: str, access_token: str, login_password: str, server_uri: Optional[str] = None, refresh_token: Optional[str] = None):
+    def from_access_token(cls, email_account: str, uid: str, access_token: str, login_password: str, server_uri: Optional[str] = None, refresh_token: Optional[str] = None, auth_time: Optional[str] = None):
         return cls(email_account, ProtonTokenData(
             uid=uid,
             access_token=access_token,
             refresh_token=refresh_token,
+            auth_time=auth_time,
             login_password=login_password,
             auth_mode='ios',
         ), server_uri)
@@ -71,92 +77,53 @@ class ProtonMailClient:
         ), server_uri)
 
     def _configure_token_data(self, token: ProtonTokenData):
-        self.uid = token.uid
-        self.access_token = token.access_token
-        self.refresh_token = token.refresh_token
-        self.login_password = token.login_password
-        self.auth_mode = token.auth_mode
-        if token.cookie:
-            self._setup_cookie(token.cookie)
-            return
-        self._setup_bearer_headers()
-        if not self.access_token and self.refresh_token:
-            self._refresh_access_token()
+        self.auth_manager = self._create_auth_manager(token)
+        self.auth_manager.apply_headers(self.sess)
+        if not self.auth_manager.access_token and self.auth_manager.refresh_token:
+            self.auth_manager.refresh(self.sess, self.api_url)
+
+    @property
+    def uid(self):
+        return self.auth_manager.uid
+
+    @property
+    def access_token(self):
+        return self.auth_manager.access_token
+
+    @property
+    def refresh_token(self):
+        return self.auth_manager.refresh_token
+
+    @property
+    def login_password(self):
+        return self.auth_manager.login_password
+
+    @property
+    def auth_time(self):
+        return self.auth_manager.auth_time
+
+    @property
+    def auth_mode(self):
+        return getattr(self.auth_manager, 'auth_mode', 'unknown')
 
     def _setup_bearer_headers(self):
-        self.sess.headers.update({
-            'x-pm-appversion': APP_VERSION,
-            'user-agent': USER_AGENT,
-        })
-        if self.uid:
-            self.sess.headers['x-pm-uid'] = self.uid
-        if self.access_token:
-            self.sess.headers['authorization'] = f'Bearer {self.access_token}'
-
-    def _setup_cookie(self, cookie_header: str):
-        self.sess.headers.update({
-            'x-pm-appversion': 'web-mail@5.0.112.4',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
-            'cookie': cookie_header,
-        })
-        cookie = SimpleCookie()
-        cookie.load(cookie_header)
-        for name in cookie.keys():
-            if name.startswith('AUTH-'):
-                self.uid = name[len('AUTH-'):]
-                self.sess.headers['x-pm-uid'] = self.uid
-                break
+        self.auth_manager.apply_headers(self.sess)
 
     def _refresh_access_token(self):
-        if not self.uid or not self.refresh_token:
-            raise RuntimeError('ProtonMail refresh requires uid and refresh_token')
-        logger.info('Refreshing ProtonMail access token for uid %s', self.uid)
-        old_auth = self.sess.headers.pop('authorization', None)
-        data = {
-            'UID': self.uid,
-            'RefreshToken': self.refresh_token,
-            'ResponseType': 'token',
-            'GrantType': 'refresh_token',
-            'RedirectURI': 'https://protonmail.ch',
-            'State': secrets.token_urlsafe(32),
-        }
-        if self.access_token:
-            data['AccessToken'] = self.access_token
-        try:
-            last_error = None
-            for attempt in range(3):
-                try:
-                    response = self.sess.post(f'{self.api_url}/auth/v4/refresh', json=data)
-                    break
-                except requests.RequestException as e:
-                    last_error = e
-                    logger.warning('ProtonMail refresh network error, retry %d/3', attempt + 1)
-                    if attempt == 2:
-                        raise
-                    time.sleep(1)
-            else:
-                raise last_error
-            if old_auth and response.status_code >= 400:
-                self.sess.headers['authorization'] = old_auth
-            response.raise_for_status()
-            ret = response.json()
-            if ret.get('Code') != 1000:
-                raise RuntimeError(f'ProtonMail refresh error: {redact_api_data(ret)}')
-            self.uid = ret.get('UID') or self.uid
-            self.access_token = ret['AccessToken']
-            self.refresh_token = ret.get('RefreshToken') or self.refresh_token
-            self._setup_bearer_headers()
-            return ret
-        except Exception:
-            if old_auth:
-                self.sess.headers['authorization'] = old_auth
-            raise
+        return self.auth_manager.refresh(self.sess, self.api_url)
+
+    def _setup_cookie(self, cookie_header: str):
+        token = ProtonTokenData(cookie=cookie_header, auth_mode='cookie')
+        self.auth_manager = ProtonCookieAuthManager(token)
+        self.auth_manager.apply_headers(self.sess)
+
+    def current_token(self) -> str:
+        return self.auth_manager.current_token()
 
     def _request(self, method, path, **kwargs):
         url = path if path.startswith('http') else f'{self.api_url}/{path.lstrip("/")}'
         response = self.sess.request(method, url, **kwargs)
-        if response.status_code == 401 and self.refresh_token:
-            self._refresh_access_token()
+        if response.status_code == 401 and self.auth_manager.refresh(self.sess, self.api_url):
             response = self.sess.request(method, url, **kwargs)
         if response.status_code == 401:
             raise RuntimeError(f'ProtonMail unauthorized for {url}. Please refresh the provided token/cookie.')
@@ -180,20 +147,18 @@ class ProtonMailClient:
             raise RuntimeError('ProtonMail login password is required in token for PGP decryption.')
 
         salts = self._request('get', 'core/v4/keys/salts').get('KeySalts', [])
-        key_salt = None
         for key_info in self.user.get('Keys', []):
             key_id = key_info.get('ID')
             if not key_id:
                 continue
             for salt in salts:
                 if salt.get('ID') == key_id and salt.get('KeySalt'):
-                    key_salt = salt['KeySalt']
-                    break
-            if key_salt is not None:
-                break
-        if key_salt is None:
+                    key_password = compute_key_password(self.login_password, salt['KeySalt'])
+                    self.user_key_passwords[key_id] = key_password
+                    if not self.key_password:
+                        self.key_password = key_password
+        if not self.key_password:
             raise RuntimeError('ProtonMail key salt not found for current user key')
-        self.key_password = compute_key_password(self.login_password, key_salt)
 
     def get_mailboxes(self) -> List[str]:
         return ['inbox']
@@ -251,9 +216,10 @@ class ProtonMailClient:
             return body
         keys = self.get_private_keys()
         last_error = None
+        key_passwords = self.address_key_passwords
         for key in keys:
             try:
-                return decrypt_pgp_message(body, key, self.key_password)
+                return decrypt_pgp_message(body, key, key_passwords.get(str(key.fingerprint), self.key_password))
             except Exception as e:
                 last_error = e
         raise RuntimeError('Failed to decrypt ProtonMail PGP body') from last_error
@@ -268,21 +234,51 @@ class ProtonMailClient:
         except ImportError as e:
             raise RuntimeError('PGPy is required for ProtonMail PGP decryption; install dependency from Pipfile') from e
 
+        user_keys = []
+        for key_info in self.user.get('Keys', []):
+            key_blob = key_info.get('PrivateKey')
+            key_password = self.user_key_passwords.get(key_info.get('ID')) or self.key_password
+            if not key_blob:
+                continue
+            key, _ = pgpy.PGPKey.from_blob(key_blob)
+            user_keys.append((key, key_password))
+
         addresses = self._request('get', 'core/v4/addresses', params={'Page': '0', 'PageSize': '50'}).get('Addresses', [])
-        key_blobs = []
+        keys = []
         for address in addresses:
             if address.get('Email', '').lower() != self.email_account.lower():
                 continue
-            key_blobs.extend(key_info.get('PrivateKey') for key_info in address.get('Keys', []) if key_info.get('PrivateKey'))
-        if not key_blobs:
-            key_blobs.extend(key_info.get('PrivateKey') for key_info in self.user.get('Keys', []) if key_info.get('PrivateKey'))
+            for key_info in address.get('Keys', []):
+                key_blob = key_info.get('PrivateKey')
+                if not key_blob:
+                    continue
+                key, _ = pgpy.PGPKey.from_blob(key_blob)
+                if key_info.get('Token'):
+                    token_value = self._decrypt_address_key_token(user_keys, key_info['Token'])
+                    self.address_key_passwords[str(key.fingerprint)] = token_value.decode('utf-8', errors='replace') if isinstance(token_value, bytes) else str(token_value)
+                keys.append(key)
+        if not keys:
+            keys.extend(key for key, _ in user_keys)
 
-        keys = []
-        for key_blob in key_blobs:
-            key, _ = pgpy.PGPKey.from_blob(key_blob)
-            keys.append(key)
         self.private_keys = keys
         return keys
+
+    def _decrypt_address_key_token(self, user_keys, token: str):
+        try:
+            import pgpy
+        except ImportError as e:
+            raise RuntimeError('PGPy is required for ProtonMail PGP decryption; install dependency from Pipfile') from e
+
+        token_message = pgpy.PGPMessage.from_blob(token)
+        last_error = None
+        for user_key, key_password in user_keys:
+            try:
+                with user_key.unlock(key_password) as unlocked_key:
+                    decrypted = unlocked_key.decrypt(token_message)
+                return decrypted.message
+            except Exception as e:
+                last_error = e
+        raise RuntimeError('Failed to decrypt ProtonMail address key token') from last_error
 
     def refresh_connection(self):
         self._request('get', 'core/v4/users')

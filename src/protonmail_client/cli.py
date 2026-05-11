@@ -1,25 +1,55 @@
 import argparse
+import asyncio
 import json
 import logging
+import time
 from getpass import getpass
+from pathlib import Path
 
 from .auth import API_URL, ProtonIOSLogin, needs_2fa, read_challenge_payload
+from .captcha_solver_cli import parse_token_from_web_url, solve_token
 from .token import build_proton_token
 
 logger = logging.getLogger(__name__)
 
 
+def build_human_verification_token(details: dict, token_suffix: str) -> str:
+    token = details.get('HumanVerificationToken')
+    if not token:
+        return token_suffix
+    if not token_suffix:
+        return ''
+    if ':' in token_suffix:
+        return token_suffix
+    return f'{token}:{token_suffix}'
+
+
+def default_captcha_solver_path() -> str:
+    return str(Path(__file__).resolve().parents[2] / 'vendor' / 'proton-captcha-solver')
+
+
 def input_captcha_callback(details: dict) -> str:
     web_url = details.get('WebUrl')
-    token = details.get('HumanVerificationToken')
     methods = details.get('HumanVerificationMethods')
     print('\n需要完成 Proton human verification。')
     print(f'WebUrl: {web_url}')
     print(f'Methods: {methods}')
     print('请在浏览器打开 WebUrl 完成 captcha。')
-    print('如果完成后页面/抓包给了新的 token，请粘贴新 token；否则直接回车使用上面的 HumanVerificationToken。')
-    user_token = input('Human verification token [回车使用默认]: ').strip()
-    return user_token or token or ''
+    print('完成后只粘贴验证码结果里冒号(:)后面的部分；程序会自动拼接 HumanVerificationToken。')
+    user_token_suffix = input('Human verification token suffix: ').strip()
+    return build_human_verification_token(details, user_token_suffix)
+
+
+def auto_captcha_callback(details: dict) -> str:
+    captcha_token = details.get('HumanVerificationToken') or parse_token_from_web_url(details.get('WebUrl') or '')
+    if not captcha_token:
+        logger.warning('Automatic captcha solver could not find HumanVerificationToken; falling back to manual input')
+        return input_captcha_callback(details)
+    try:
+        return asyncio.run(solve_token(captcha_token, default_captcha_solver_path()))
+    except Exception as e:
+        logger.warning('Automatic captcha solver failed: %s', e)
+        return input_captcha_callback(details)
 
 
 def parse_args():
@@ -29,7 +59,8 @@ def parse_args():
     parser.add_argument('--api-url', default=API_URL)
     parser.add_argument('--timeout', type=int, default=30)
     parser.add_argument('--challenge-dump', help='Optional request.dump from auth/v4/sessions or auth/v4 to reuse the iOS challenge Payload')
-    parser.add_argument('--human-verification-token', help='Pre-filled captcha token; if omitted and required, prompt in the same session')
+    parser.add_argument('--human-verification-token', help='Pre-filled captcha token suffix after colon, or a full captcha token')
+    parser.add_argument('--auto-captcha', action='store_true', help='Automatically solve Proton captcha using bundled solver')
     parser.add_argument('--human-verification-type', default='captcha')
     parser.add_argument('--two-factor-code', help='TOTP code; if omitted and required, prompt')
     parser.add_argument('--email', help='Email address for key password salt lookup; defaults to username')
@@ -60,9 +91,11 @@ def main():
     client.init_session()
 
     if args.human_verification_token:
-        def captcha_callback(_details):
+        def captcha_callback(details):
             logger.info('Using pre-filled human verification token')
-            return args.human_verification_token
+            return build_human_verification_token(details, args.human_verification_token)
+    elif args.auto_captcha:
+        captcha_callback = auto_captcha_callback
     else:
         captcha_callback = input_captcha_callback
 
@@ -77,10 +110,12 @@ def main():
         auth['AccessToken'] = refreshed.get('AccessToken') or auth['AccessToken']
         auth['UID'] = refreshed.get('UID') or auth['UID']
     key_password = None if args.skip_key_password else client.get_key_password(password, args.email or args.username)
+    auth_time = str(auth.get('AuthTime') or auth.get('ServerTime') or int(time.time()))
     result = {
         'type': 'ios-refresh',
         'uid': auth['UID'],
         'refresh_token': auth.get('RefreshToken'),
+        'auth_time': auth_time,
         'login_password': password,
     }
     if args.output_access_token:
@@ -94,7 +129,7 @@ def main():
     if args.output_access_token:
         token = f"proton:ios:{result['uid']}:{auth['AccessToken']}:{result.get('refresh_token') or ''}:{password}"
     else:
-        token = build_proton_token(result.get('refresh_token') or '', password, result['uid'])
+        token = build_proton_token(result['uid'], auth['AccessToken'], result.get('refresh_token') or '', result['auth_time'], password)
     print(token)
 
 

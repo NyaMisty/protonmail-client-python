@@ -286,7 +286,7 @@ class ProtonIOSLogin:
 
     def refresh_access_token(self, uid: str, refresh_token: str, access_token: Optional[str] = None) -> Dict[str, Any]:
         logger.info('Testing Proton refresh token exchange')
-        old_auth = self.sess.headers.pop('Authorization', None)
+        old_auth = self.sess.headers.get('Authorization')
         payload = {
             'UID': uid,
             'RefreshToken': refresh_token,

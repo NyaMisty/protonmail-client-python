@@ -22,11 +22,20 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-pgp = ["PGPy>=0.6.0"]
+pgp = ["PGPy>=0.6.0", "standard-imghdr>=3.13.0"]
 verify = ["proton-client", "python-gnupg>=0.5.0"]
+captcha = [
+    "brotli",
+    "httpx[http2]",
+    "numpy",
+    "opencv-python",
+    "pytweening",
+    "zstandard",
+]
 
 [project.scripts]
 protonmail-client = "protonmail_client.cli:main"
+proton-captcha-solve = "protonmail_client.captcha_solver_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

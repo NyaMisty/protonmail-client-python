@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -10,6 +10,7 @@ class ProtonTokenData:
     uid: Optional[str] = None
     login_password: Optional[str] = None
     access_token: Optional[str] = None
+    auth_time: Optional[str] = None
     cookie: Optional[str] = None
     auth_mode: str = 'ios'
 
@@ -20,37 +21,38 @@ def parse_oauth_token_string(value: str) -> Optional[Tuple[str, str, Optional[st
     body = value[len('token:'):]
     provider_name, sep, token_data = body.partition(':')
     if not sep:
-        raise ValueError('invalid token string, expected token:{provider}:{refresh_token}')
-    refresh_token, _, additional_data = token_data.partition(':::')
-    if not provider_name or not refresh_token:
-        raise ValueError('invalid token string, expected token:{provider}:{refresh_token}')
-    return provider_name, refresh_token, additional_data or None
-
-
-def parse_token_additional_data(additional_data: Optional[str]) -> Dict[str, str]:
-    if not additional_data or ':' not in additional_data:
-        raise ValueError('Proton token additional_data must be <login_password>:<uid>')
-    login_password, uid = additional_data.rsplit(':', 1)
-    if not login_password or not uid:
-        raise ValueError('Proton token additional_data must be <login_password>:<uid>')
-    return {'login_password': login_password, 'uid': uid}
+        raise ValueError('invalid token string, expected token:{provider}:{token_payload}')
+    token_payload, _, additional_data = token_data.partition(':::')
+    if not provider_name or not token_payload:
+        raise ValueError('invalid token string, expected token:{provider}:{token_payload}')
+    return provider_name, token_payload, additional_data or None
 
 
 def parse_proton_token(value: str) -> ProtonTokenData:
     parsed = parse_oauth_token_string(value)
     if parsed is None:
-        raise ValueError('invalid Proton token, expected token:proton:<refresh_token>:::<additional_data>')
-    provider_name, refresh_token, additional_data = parsed
+        raise ValueError('invalid Proton token, expected token:proton:<uid>.<access_token>.<refresh_token>.<auth_time>:::<login_password>')
+    provider_name, token_payload, additional_data = parsed
     if provider_name != 'proton':
         raise ValueError(f'unsupported Proton OAuth provider: {provider_name}')
-    data = parse_token_additional_data(additional_data)
+    if not additional_data:
+        raise ValueError('Proton token additional_data must be <login_password>')
+    uid, sep, rest = token_payload.partition('.')
+    if not sep:
+        raise ValueError('invalid Proton token, expected token:proton:<uid>.<access_token>.<refresh_token>.<auth_time>:::<login_password>')
+    access_token, sep, rest = rest.partition('.')
+    refresh_token, sep, auth_time = rest.rpartition('.')
+    if not sep or not uid or not access_token or not refresh_token or not auth_time:
+        raise ValueError('invalid Proton token, expected token:proton:<uid>.<access_token>.<refresh_token>.<auth_time>:::<login_password>')
     return ProtonTokenData(
+        uid=uid,
+        access_token=access_token,
         refresh_token=refresh_token,
-        uid=data['uid'],
-        login_password=data['login_password'],
+        auth_time=auth_time,
+        login_password=additional_data,
         auth_mode='ios',
     )
 
 
-def build_proton_token(refresh_token: str, login_password: str, uid: str) -> str:
-    return f'token:proton:{refresh_token}:::{login_password}:{uid}'
+def build_proton_token(uid: str, access_token: str, refresh_token: str, auth_time: str, login_password: str) -> str:
+    return f'token:proton:{uid}.{access_token}.{refresh_token}.{auth_time}:::{login_password}'
