@@ -116,7 +116,6 @@ def main():
         'uid': auth['UID'],
         'refresh_token': auth.get('RefreshToken'),
         'auth_time': auth_time,
-        'login_password': password,
     }
     if args.output_access_token:
         result['type'] = 'ios'
@@ -127,9 +126,11 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
         return
     if args.output_access_token:
-        token = f"proton:ios:{result['uid']}:{auth['AccessToken']}:{result.get('refresh_token') or ''}:{password}"
+        token = f"proton:ios:{result['uid']}:{auth['AccessToken']}:{result.get('refresh_token') or ''}:{key_password or ''}"
     else:
-        token = build_proton_token(result['uid'], auth['AccessToken'], result.get('refresh_token') or '', result['auth_time'], password)
+        if not key_password:
+            raise RuntimeError('key_password is required for Proton token output')
+        token = build_proton_token(result['uid'], auth['AccessToken'], result.get('refresh_token') or '', result['auth_time'], key_password)
     print(token)
 
 

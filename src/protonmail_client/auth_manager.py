@@ -19,7 +19,7 @@ class ProtonAuthManager(Protocol):
     access_token: Optional[str]
     refresh_token: Optional[str]
     auth_time: Optional[str]
-    login_password: Optional[str]
+    key_password: Optional[str]
 
     def apply_headers(self, session: requests.Session) -> None:
         ...
@@ -37,7 +37,7 @@ class ProtonBearerAuthManager:
         self.access_token = token.access_token
         self.refresh_token = token.refresh_token
         self.auth_time = token.auth_time
-        self.login_password = token.login_password
+        self.key_password = token.key_password
         self.auth_mode = token.auth_mode
 
     def apply_headers(self, session: requests.Session) -> None:
@@ -96,9 +96,9 @@ class ProtonBearerAuthManager:
             raise
 
     def current_token(self) -> str:
-        if not self.uid or not self.access_token or not self.refresh_token or not self.auth_time or not self.login_password:
-            raise RuntimeError('ProtonMail token requires uid, access_token, refresh_token, auth_time and login_password')
-        return build_proton_token(self.uid, self.access_token, self.refresh_token, self.auth_time, self.login_password)
+        if not self.uid or not self.access_token or not self.refresh_token or not self.key_password or not self.auth_time:
+            raise RuntimeError('ProtonMail token requires uid, access_token, refresh_token, key_password and auth_time')
+        return build_proton_token(self.uid, self.access_token, self.refresh_token, self.auth_time, self.key_password)
 
 
 class ProtonCookieAuthManager:
@@ -108,7 +108,7 @@ class ProtonCookieAuthManager:
         self.access_token = token.access_token
         self.refresh_token = token.refresh_token
         self.auth_time = token.auth_time
-        self.login_password = token.login_password
+        self.key_password = token.key_password
         self.auth_mode = token.auth_mode
 
     def apply_headers(self, session: requests.Session) -> None:

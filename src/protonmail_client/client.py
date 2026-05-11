@@ -9,7 +9,7 @@ import requests
 
 from .auth import ACCEPT, redact_api_data
 from .auth_manager import ProtonAuthManager, ProtonBearerAuthManager, ProtonCookieAuthManager
-from .crypto import compute_key_password, decrypt_pgp_message
+from .crypto import decrypt_pgp_message
 from .message import proton_message_to_rfc822
 from .token import ProtonTokenData, parse_proton_token
 
@@ -34,7 +34,6 @@ class ProtonMailClient:
             'accept': ACCEPT,
             'x-pm-locale': 'zh_CN',
         })
-        self.key_password = None
         self.total_cache: Dict[str, int] = {}
         self.message_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
         self.private_keys = None
@@ -57,22 +56,22 @@ class ProtonMailClient:
         return ProtonBearerAuthManager(token_data)
 
     @classmethod
-    def from_access_token(cls, email_account: str, uid: str, access_token: str, login_password: str, server_uri: Optional[str] = None, refresh_token: Optional[str] = None, auth_time: Optional[str] = None):
+    def from_access_token(cls, email_account: str, uid: str, access_token: str, key_password: str, server_uri: Optional[str] = None, refresh_token: Optional[str] = None, auth_time: Optional[str] = None):
         return cls(email_account, ProtonTokenData(
             uid=uid,
             access_token=access_token,
             refresh_token=refresh_token,
             auth_time=auth_time,
-            login_password=login_password,
+            key_password=key_password,
             auth_mode='ios',
         ), server_uri)
 
     @classmethod
-    def from_cookie(cls, email_account: str, cookie_header: str, login_password: str, server_uri: Optional[str] = None, refresh_token: Optional[str] = None):
+    def from_cookie(cls, email_account: str, cookie_header: str, key_password: str, server_uri: Optional[str] = None, refresh_token: Optional[str] = None):
         return cls(email_account, ProtonTokenData(
             cookie=cookie_header,
             refresh_token=refresh_token,
-            login_password=login_password,
+            key_password=key_password,
             auth_mode='cookie',
         ), server_uri)
 
@@ -95,8 +94,8 @@ class ProtonMailClient:
         return self.auth_manager.refresh_token
 
     @property
-    def login_password(self):
-        return self.auth_manager.login_password
+    def key_password(self):
+        return self.auth_manager.key_password
 
     @property
     def auth_time(self):
@@ -143,22 +142,15 @@ class ProtonMailClient:
         return self._request('get', 'core/v4/users')['User']
 
     def _load_key_password(self):
-        if not self.login_password:
-            raise RuntimeError('ProtonMail login password is required in token for PGP decryption.')
-
-        salts = self._request('get', 'core/v4/keys/salts').get('KeySalts', [])
-        for key_info in self.user.get('Keys', []):
-            key_id = key_info.get('ID')
-            if not key_id:
-                continue
-            for salt in salts:
-                if salt.get('ID') == key_id and salt.get('KeySalt'):
-                    key_password = compute_key_password(self.login_password, salt['KeySalt'])
-                    self.user_key_passwords[key_id] = key_password
-                    if not self.key_password:
-                        self.key_password = key_password
         if not self.key_password:
-            raise RuntimeError('ProtonMail key salt not found for current user key')
+            raise RuntimeError('ProtonMail key password is required in token for PGP decryption.')
+        user_keys = self.user.get('Keys', [])
+        if not user_keys:
+            raise RuntimeError('ProtonMail user key not found')
+        for key_info in user_keys:
+            key_id = key_info.get('ID')
+            if key_id:
+                self.user_key_passwords[key_id] = self.key_password
 
     def get_mailboxes(self) -> List[str]:
         return ['inbox']
@@ -228,7 +220,7 @@ class ProtonMailClient:
         if self.private_keys is not None:
             return self.private_keys
         if not self.key_password:
-            raise RuntimeError('ProtonMail login password is required in token for PGP decryption.')
+            raise RuntimeError('ProtonMail key password is required in token for PGP decryption.')
         try:
             import pgpy
         except ImportError as e:
